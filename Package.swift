@@ -86,7 +86,7 @@ let package = Package(
         ),
         .target(
             name: "ldid",
-            dependencies: ["ldid-core"],
+            dependencies: ["ldid-core", "OpenSSL"],
             path: "AltSign/ldid",
             exclude: [
                 "alt_ldid.hpp",
@@ -135,7 +135,7 @@ let package = Package(
 
         .target(
             name: "CAltSign",
-            dependencies: ["AltCrypto", "ldid"],
+            dependencies: ["AltCrypto", "ldid", "OpenSSL"],
             path: "",
             exclude: [
                 "AltSign/ldid/alt_ldid.cpp",
