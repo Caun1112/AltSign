@@ -11,6 +11,13 @@ import Foundation
 @_exported import CAltSign
 import CAltSign.Private
 
+// Android ADI identities must report Android to GrandSlam. Keep this override local
+// to sign-in and trusted-device 2FA; URL lookup, provisioning, and SMS retain the
+// original anisette client info. See https://github.com/Dadoum/anisette-v3-server/issues/61
+// and https://github.com/altstoreio/AltStore/issues/1828#issuecomment-6155835822,
+// following https://github.com/FrizzleM/SideInstaller/commit/d9c283190f086b79863d093fabcf23275bbaa232.
+private let androidGrandSlamClientInfo = "<Pixel 5> <Android;11;RQ3A.211001.001> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+
 public extension ALTAppleAPIError
 {
     static func unknown(userInfo: [String: Any] = [:], sourceFile: String = #fileID, sourceLine: UInt = #line) -> ALTAppleAPIError
@@ -115,13 +122,17 @@ public extension ALTAppleAPI
                             
                             context.dsid = dsid
                             
-                            let authType = statusDictionary["au"] as? String
+                            let reportedAuthType = statusDictionary["au"] as? String
+                            // Android sign-in can return a 409 challenge without au after
+                            // Apple has already pushed the code to the trusted devices.
+                            let codeAlreadySent = reportedAuthType == nil && (statusDictionary["hsc"] as? Int) == 409
+                            let authType = codeAlreadySent ? "trustedDeviceSecondaryAuth" : reportedAuthType
                             switch authType
                             {
                             case "trustedDeviceSecondaryAuth":
                                 guard let verificationHandler = verificationHandler else { throw ALTAppleAPIError(.requiresTwoFactorAuthentication) }
                                 
-                                self.requestTrustedDeviceTwoFactorCode(dsid: dsid, idmsToken: idmsToken, anisetteData: anisetteData, verificationHandler: verificationHandler) { (result) in
+                                self.requestTrustedDeviceTwoFactorCode(dsid: dsid, idmsToken: idmsToken, anisetteData: anisetteData, codeAlreadySent: codeAlreadySent, verificationHandler: verificationHandler) { (result) in
                                     switch result
                                     {
                                     case .failure(let error): completionHandler(nil, nil, error)
@@ -232,6 +243,7 @@ private extension ALTAppleAPI
     func requestTrustedDeviceTwoFactorCode(dsid: String,
                                            idmsToken: String,
                                            anisetteData: ALTAnisetteData,
+                                           codeAlreadySent: Bool,
                                            verificationHandler: @escaping (@escaping (String?) -> Void) -> Void,
                                            completionHandler: @escaping (Result<Void, Error>) -> Void)
     {
@@ -240,7 +252,7 @@ private extension ALTAppleAPI
         
         let request = self.makeTwoFactorCodeRequest(url: requestURL, dsid: dsid, idmsToken: idmsToken, anisetteData: anisetteData)
         
-        let requestCodeTask = self.session.dataTask(with: request) { (data, response, error) in
+        let requestCodeCompletionHandler: (Data?, URLResponse?, Error?) -> Void = { (_, _, error) in
             do
             {
                 guard error == nil else { throw error! }
@@ -317,7 +329,16 @@ private extension ALTAppleAPI
             }
         }
         
-        requestCodeTask.resume()
+        if codeAlreadySent
+        {
+            // Do not issue /auth/verify/trusteddevice again for an already pushed code.
+            requestCodeCompletionHandler(nil, nil, nil)
+        }
+        else
+        {
+            let requestCodeTask = self.session.dataTask(with: request, completionHandler: requestCodeCompletionHandler)
+            requestCodeTask.resume()
+        }
     }
     
     func requestSMSTwoFactorCode(dsid: String,
@@ -453,7 +474,7 @@ private extension ALTAppleAPI
             
             let httpHeaders = [
                 "Content-Type": "text/x-xml-plist",
-                "X-MMe-Client-Info": anisetteData.deviceDescription,
+                "X-MMe-Client-Info": androidGrandSlamClientInfo,
                 "Accept": "*/*",
                 "User-Agent": "AuthKit/1 (Macintosh; OS X 26.5.2) (com.apple.dt.Xcode/26.0)"
             ]
@@ -532,6 +553,11 @@ private extension ALTAppleAPI
         let identityTokenData = identityToken.data(using: .utf8)!
         let encodedIdentityToken = identityTokenData.base64EncodedString()
         
+        // SMS /auth/verify/phone/* rejects the Android identity. Only the trusted
+        // device request and validation endpoints use the GrandSlam override.
+        let usesAndroidClientInfo = url.path == "/auth/verify/trusteddevice" || url.path == "/grandslam/GsService2/validate"
+        let clientInfo = usesAndroidClientInfo ? androidGrandSlamClientInfo : anisetteData.deviceDescription
+
         let httpHeaders = [
             "Accept": "application/x-buddyml",
             "Accept-Language": "en-us",
@@ -545,7 +571,7 @@ private extension ALTAppleAPI
             "X-Apple-I-MD-LU": anisetteData.localUserID,
             "X-Apple-I-MD-RINFO": "\(anisetteData.routingInfo)",
             "X-Mme-Device-Id": anisetteData.deviceUniqueIdentifier,
-            "X-MMe-Client-Info": anisetteData.deviceDescription,
+            "X-MMe-Client-Info": clientInfo,
             "X-Apple-I-Client-Time": self.dateFormatter.string(from: anisetteData.date),
             "X-Apple-Locale": anisetteData.locale.identifier,
             "X-Apple-I-TimeZone": anisetteData.timeZone.abbreviation() ?? "PST"
